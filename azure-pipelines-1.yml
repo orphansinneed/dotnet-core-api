@@ -1,0 +1,84 @@
+variables:
+  # Variable below is also used as the name of the agent in the AzDO agent pool
+  # ACI_INSTANCE_NAME: apache-bench-inducer-$(Build.BuildId)
+  ACI_INSTANCE_NAME: apache-bench-inducer-1# Resource group in which the Load inducer ACI instance is created
+  ACI_RESOURCE_GROUP_NAME: "internal-app-rg"# Resource group of the vnet in which the ACI instance is to be created
+  VNET_RESOURCE_GROUP_NAME: "internal-app-rg"# Number of CPUs for the ACI instance
+  NUMBER_OF_CPUS: 1# Memory in GB of the ACI Instance
+  MEMORY_GB: 3# The Azure Subscription. Can be fetched from Azure Key vault. Currently passed from pipeline
+  # Can be fetched from Key Vault
+  # SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)# VNet Name where the ACI Instance is to be created
+  VNET_NAME: "internal-vnet"# Subnet in which the ACI Instance is to be created
+  SUBNET_NAME: "aci-ab-inducer-snet"# AzDO PAT token for the ACI Instance to talk to AzDO. Currently passed from pipeline
+  # Can be fetched from Key Vault
+  # AzDO_TOKEN: $(AzDO_TOKEN)# The AzDO Organization name whose agent pool the ACI instance will join. Currently passed from pipeline
+  # Can be fetched from Key Vault
+  # AzDO_ORGANIZATION: $(AzDO_ORGANIZATION)# The Agent Pool Name for the ACI instance to Join
+  AzDO_POOL: private-vnet-load-inducers# The Container Image image from docker hub to be used by the AzDO Agent as its base image
+  AzDO_AGENT_IMAGE: "microsoft/vsts-agent"stages: - stage: initialize_benchmark_testing_infrastructure_in_vnet
+jobs :
+- job: initialize_benchmark_testing_infrastructure_in_vnet
+  pool:
+        vmImage: 'Ubuntu-16.04'
+  steps:
+      - task: AzureCLI@1
+        displayName: "create load test infra in private vnet using azure container instance"
+        inputs:
+          azureSubscription: 'internal-app-rg-contributor'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            CURRENT_ACI_COUNT=$(az container list -o table | grep $ACI_INSTANCE_NAME | grep $ACI_RESOURCE_GROUP_NAME | wc -l)
+            if [ $CURRENT_ACI_COUNT -gt 0 ]; 
+            then 
+              echo "ACI instance for the release already exists";
+            else 
+              echo "ACI instance does not exist. Creating .......";
+              az container create \
+              --name $(ACI_INSTANCE_NAME) \
+              --resource-group $(ACI_RESOURCE_GROUP_NAME) \
+              --cpu $(NUMBER_OF_CPUS) \
+              --memory $(MEMORY_GB) \
+              --command-line "/bin/bash -c 'apt-get update && apt-get install -y apache2-utils && /vsts/start.sh'" \
+              --vnet "/subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(VNET_RESOURCE_GROUP_NAME)/providers/Microsoft.Network/virtualNetworks/$(VNET_NAME)" \
+              --subnet "/subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(VNET_RESOURCE_GROUP_NAME)/providers/Microsoft.Network/virtualNetworks/$(VNET_NAME)/subnets/$(SUBNET_NAME)" \
+              --image $(AzDO_AGENT_IMAGE) -e VSTS_TOKEN=$(AzDO_TOKEN) VSTS_ACCOUNT=$(AzDO_ORGANIZATION) VSTS_POOL=$(AzDO_POOL) VSTS_AGENT=$(ACI_INSTANCE_NAME)
+              
+            fi- stage: execute_benchmark_tests_and_publish_report
+  jobs:
+    - job: execute_benchmark_tests
+      pool: $(AzDO_POOL)
+      steps:
+      - script: |
+          echo "Execute Apache Bench Tests"
+          ab -n 50000 -c 10 http://172.17.1.4/ 2>&1 | tee /tmp/ab-result.txt
+          NINETY_FIVE_PERCENTILE_REQUEST_TIME=$(cat /tmp/ab-result.txt | grep 95% | awk '{ print $2 }')# install bc for floating point calculation to get time in milliseconds
+          apt-get install bcNINETY_FIVE_PERCENTILE_REQUEST_TIME_IN_MS=$(bc <<< "scale=4; $NINETY_FIVE_PERCENTILE_REQUEST_TIME/ 1000 ")echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?> \
+          <testsuites > \
+              <testsuite failures=\"0\" name=\"Apache-Bench-95th-Percentile-Response-50K-with-10-concurrent\"  tests=\"1\" time=\"$NINETY_FIVE_PERCENTILE_REQUEST_TIME_IN_MS\"> \
+                  <testcase  name=\"95th-Percentile-Requests-Served-within\" time=\"$NINETY_FIVE_PERCENTILE_REQUEST_TIME_IN_MS\"/> \
+              </testsuite> \
+          </testsuites>" > $(System.DefaultWorkingDirectory)/TEST-junit.xmldisplayName: 'Execute Apache Bench Tests'- task: PublishTestResults@2
+        displayName: 'Publish Test Results'
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: '**/TEST-*.xml'
+          searchFolder: $(System.DefaultWorkingDirectory)
+          testRunTitle: 'Apache-Bench-50KRequests-10ConcurrentUsers-95thPercentileResponseTime'- stage: clean_up_test_infrastructure
+jobs:
+- job: delete_aci_instance
+  pool:
+      vmImage: 'Ubuntu-16.04'
+      steps:
+- task: AzureCLI@1
+  displayName: "clean up load test infra from private (delete azure container instance)"
+          inputs:
+          azureSubscription: 'internal-app-rg-contributor'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            if [ $(DELETE_TEST_INFRA) == "TRUE" ]; 
+            then 
+              echo "Deleting ACI Instance ......";
+              az container delete --name $(ACI_INSTANCE_NAME) --resource-group $(ACI_RESOURCE_GROUP_NAME) --yes
+            else 
+              echo "Not deleting ACI Instance as per pipeline configuration .......";
+            fi
